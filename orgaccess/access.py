@@ -16,7 +16,7 @@ on the very next request.
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import AccessGroup, AuditLog, Level, PrivateItem, Sensitivity, TemporaryGrant, ToolGrant, User
+from .models import AccessGroup, AuditLog, Level, PrivateItem, Sensitivity, TemporaryGrant, ToolGrant, User, ToolTier
 
 CLEARANCE_BY_LEVEL = {
     Level.EXECUTIVE: Sensitivity.CONFIDENTIAL,
@@ -27,6 +27,10 @@ CLEARANCE_BY_LEVEL = {
     Level.JUNIOR: Sensitivity.INTERNAL,
 }
 
+V1_AVAILABLE_TOOL_TIERS = frozenset({
+    ToolTier.READ,
+    ToolTier.DRAFT,
+})
 
 def active_group_ids(user, now=None):
     """Permanent memberships plus unexpired, unrevoked temporary grants."""
@@ -120,11 +124,45 @@ def effective_grants(user, now=None):
 
 
 def tools_for(user, now=None):
-    """{tool name: [grants]}  A tool may have several grants (e.g. different scopes)."""
+    """
+    Return all tools for which the user has effective grants.
+
+    This includes future capability tiers such as ACT.
+    It does not establish whether a tool is enabled for runtime discovery.
+    """
     out = {}
+
     for g in effective_grants(user, now):
         out.setdefault(g.tool.name, []).append(g)
+
     return out
+
+def available_tools_for(user, now=None):
+    """
+    Return tools that the Actor may discover and use in version one.
+
+    The user's organizational grants are still enforced first.
+    Only supported tool tiers are exposed.
+    """
+
+    if not user.is_active:
+        return {}
+
+    granted_tools = tools_for(user, now)
+
+    return {
+        name: grants
+        for name, grants in granted_tools.items()
+        if grants and grants[0].tool.tier in V1_AVAILABLE_TOOL_TIERS
+    }
+
+
+def can_discover_tool(user, tool_name, now=None):
+    """
+    Check whether a tool is both authorized and enabled for runtime use.
+    """
+
+    return tool_name in available_tools_for(user, now)
 
 
 def can_use_tool(user, tool_name, now=None):

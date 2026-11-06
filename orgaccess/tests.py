@@ -6,9 +6,21 @@ from django.test import TestCase
 from django.utils import timezone
 
 from .access import (
-    CLEARANCE_BY_LEVEL, active_group_codes, active_group_ids, approval_limit, can_use_tool, can_view,
-    report_ids, scopes_for, tools_for, visible_private_items, visible_to,
+    CLEARANCE_BY_LEVEL,
+    active_group_codes,
+    active_group_ids,
+    approval_limit,
+    available_tools_for,
+    can_discover_tool,
+    can_use_tool,
+    can_view,
+    report_ids,
+    scopes_for,
+    tools_for,
+    visible_private_items,
+    visible_to,
 )
+
 from .models import (
     AccessGroup, Department, Document, DocumentChunk, Level, PrivateItem, Sensitivity,
     TemporaryGrant, User, Role
@@ -436,3 +448,60 @@ class OrgAccessTests(TestCase):
         self.assertEqual(user.department.code, "sales")
         self.assertIsNone(user.role.department_id)
         self.assertEqual(user.level, Level.OFFICER)
+
+    def test_v1_does_not_expose_act_tools(self):
+        manager = staff("finance", Level.MANAGER)
+
+        # The organizational grant remains intact.
+        self.assertTrue(
+            can_use_tool(manager, "approve_payment")
+        )
+
+        self.assertIn(
+            "approve_payment",
+            tools_for(manager),
+        )
+
+        # But the Actor cannot discover it in version one.
+        self.assertNotIn(
+            "approve_payment",
+            available_tools_for(manager),
+        )
+
+        self.assertFalse(
+            can_discover_tool(manager, "approve_payment")
+        )
+
+    def test_v1_exposes_read_and_draft_tools(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        available = available_tools_for(junior)
+
+        self.assertIn("search_policies", available)
+        self.assertIn("draft_message", available)
+
+        self.assertTrue(
+            can_discover_tool(junior, "search_policies")
+        )
+
+        self.assertTrue(
+            can_discover_tool(junior, "draft_message")
+        )
+
+        # The junior must not receive tools they weren't granted.
+        self.assertNotIn("search_documents", available)
+        self.assertNotIn("approve_request", available)
+
+    def test_inactive_user_cannot_discover_tools(self):
+        user = staff("sales", Level.MANAGER)
+
+        self.assertGreater(len(available_tools_for(user)), 0)
+
+        user.is_active = False
+        user.save()
+
+        self.assertEqual(available_tools_for(user), {})
+
+        self.assertFalse(
+            can_discover_tool(user, "search_policies")
+        )
