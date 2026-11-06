@@ -1,0 +1,19 @@
+# Virtual environments
+artbi/
+bia/
+.venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Django
+staticfiles/
+media/
+run.md
