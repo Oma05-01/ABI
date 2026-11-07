@@ -1,6 +1,6 @@
 from datetime import timedelta
 from decimal import Decimal
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, PermissionDenied
 from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
@@ -22,8 +22,26 @@ from .access import (
 )
 
 from .models import (
-    AccessGroup, Department, Document, DocumentChunk, Level, PrivateItem, Sensitivity,
-    TemporaryGrant, User, Role
+    AccessGroup,
+    DataSource,
+    DataSourceAccessMode,
+    DataSourceType,
+    Department,
+    Document,
+    DocumentChunk,
+    Level,
+    PrivateItem,
+    Role,
+    Sensitivity,
+    Scope,
+    TemporaryGrant,
+    User,
+    AuditLog
+)
+
+from .services.source_access import (
+    data_sources_for_user,
+    resolve_data_source_access,
 )
 
 from .services.document_acl import (
@@ -31,6 +49,26 @@ from .services.document_acl import (
     update_document_acl,
 )
 
+from .services.tool_scope import (
+    filter_queryset_for_scope,
+    resolve_tool_scope,
+)
+
+from .services.data_access import (
+    get_document_for_user,
+    search_chunks_for_user,
+    search_documents_for_user,
+)
+
+from .services.private_data import (
+    create_private_item_for_user,
+    delete_private_item_for_user,
+    get_private_item_for_user,
+    list_private_items_for_user,
+    update_private_item_for_user,
+)
+
+from .services.document_acl import create_document_chunk
 
 def staff(dept, level, n=0):
     return User.objects.filter(department__code=dept, role__level=level).order_by("id")[n]
@@ -48,6 +86,25 @@ class OrgAccessTests(TestCase):
     @classmethod
     def setUpTestData(cls):
         call_command("seed_org", verbosity=0)
+
+    def make_data_source(
+            self,
+            *,
+            code,
+            owner_department,
+            access_mode,
+            minimum_level,
+            is_active=True,
+    ):
+        return DataSource.objects.create(
+            code=code,
+            name=code.replace("-", " ").title(),
+            source_type=DataSourceType.DOCUMENT_COLLECTION,
+            owner_department=owner_department,
+            access_mode=access_mode,
+            minimum_level=minimum_level,
+            is_active=is_active,
+        )
 
     # ---------- shape of the mock company ----------
 
@@ -505,3 +562,658 @@ class OrgAccessTests(TestCase):
         self.assertFalse(
             can_discover_tool(user, "search_policies")
         )
+
+    def test_runtime_discovery_preserves_multiple_grants(self):
+        head = staff("sales", Level.DEPT_HEAD)
+
+        original = tools_for(head)
+        available = available_tools_for(head)
+
+        self.assertIn("query_metrics", available)
+
+        self.assertEqual(
+            original["query_metrics"],
+            available["query_metrics"],
+        )
+
+        self.assertEqual(
+            scopes_for(head, "query_metrics"),
+            {"department", "company_aggregate"},
+        )
+
+    def test_scope_requires_matching_tool_grant(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        with self.assertRaises(PermissionDenied):
+            resolve_tool_scope(
+                junior,
+                "get_ar_ap_aging",
+                Scope.DEPARTMENT,
+            )
+
+    def test_self_scope_limits_records_to_requester(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        context = resolve_tool_scope(
+            junior,
+            "get_my_tasks",
+            Scope.SELF,
+        )
+
+        result = filter_queryset_for_scope(
+            User.objects.all(),
+            context,
+            user_field="pk",
+        )
+
+        self.assertEqual(
+            set(result.values_list("pk", flat=True)),
+            {junior.pk},
+        )
+
+    def test_team_scope_limits_records_to_reporting_line(self):
+        manager = staff("sales", Level.MANAGER)
+
+        context = resolve_tool_scope(
+            manager,
+            "get_team_status",
+            Scope.TEAM,
+        )
+
+        result = filter_queryset_for_scope(
+            User.objects.all(),
+            context,
+            user_field="pk",
+        )
+
+        actual_ids = set(result.values_list("pk", flat=True))
+        expected_ids = report_ids(manager)
+
+        self.assertSetEqual(actual_ids, expected_ids)
+        self.assertNotIn(manager.pk, actual_ids)
+
+    def test_department_scope_limits_records_to_own_department(self):
+        manager = staff("finance", Level.MANAGER)
+
+        context = resolve_tool_scope(
+            manager,
+            "get_budget_status",
+            Scope.DEPARTMENT,
+        )
+
+        result = filter_queryset_for_scope(
+            User.objects.all(),
+            context,
+            department_field="department_id",
+        )
+
+        expected_ids = set(
+            User.objects.filter(
+                department=manager.department
+            ).values_list("pk", flat=True)
+        )
+
+        actual_ids = set(result.values_list("pk", flat=True))
+
+        self.assertSetEqual(actual_ids, expected_ids)
+
+    def test_company_aggregate_rejects_raw_queryset_access(self):
+        head = staff("sales", Level.DEPT_HEAD)
+
+        context = resolve_tool_scope(
+            head,
+            "query_metrics",
+            Scope.COMPANY_AGGREGATE,
+        )
+
+        self.assertTrue(context.aggregate_only)
+
+        with self.assertRaises(PermissionDenied):
+            filter_queryset_for_scope(
+                User.objects.all(),
+                context,
+                user_field="pk",
+            )
+
+    def test_acl_scope_rejects_non_access_controlled_models(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        context = resolve_tool_scope(
+            junior,
+            "search_policies",
+            Scope.ACL,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            filter_queryset_for_scope(
+                User.objects.all(),
+                context,
+            )
+
+    def test_acl_scope_uses_visible_to(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        context = resolve_tool_scope(
+            junior,
+            "search_policies",
+            Scope.ACL,
+        )
+
+        result = filter_queryset_for_scope(
+            Document.objects.all(),
+            context,
+        )
+
+        expected_ids = set(
+            visible_to(
+                junior,
+                Document.objects.all(),
+            ).values_list("pk", flat=True)
+        )
+
+        actual_ids = set(result.values_list("pk", flat=True))
+
+        self.assertSetEqual(actual_ids, expected_ids)
+
+        self.assertFalse(
+            result.filter(title="Payroll Register").exists()
+        )
+
+    def test_company_scope_does_not_override_document_acl(self):
+        md = User.objects.get(role__code="md")
+
+        context = resolve_tool_scope(
+            md,
+            "query_metrics",
+            Scope.COMPANY,
+        )
+
+        result = filter_queryset_for_scope(
+            Document.objects.all(),
+            context,
+        )
+
+        expected_ids = set(
+            visible_to(
+                md,
+                Document.objects.all(),
+            ).values_list("pk", flat=True)
+        )
+
+        actual_ids = set(result.values_list("pk", flat=True))
+
+        self.assertSetEqual(actual_ids, expected_ids)
+
+        self.assertFalse(
+            result.filter(title="Payroll Register").exists()
+        )
+
+    def test_scope_resolver_rejects_stale_inactive_user(self):
+        user = staff("sales", Level.MANAGER)
+
+        stale_user = User.objects.get(pk=user.pk)
+
+        User.objects.filter(pk=user.pk).update(is_active=False)
+
+        with self.assertRaises(PermissionDenied):
+            resolve_tool_scope(
+                stale_user,
+                "get_team_status",
+                Scope.TEAM,
+            )
+
+    def test_document_access_requires_tool_authorization(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        with self.assertRaises(PermissionDenied):
+            search_documents_for_user(
+                user=junior,
+                query="Warehouse",
+                tool_name="search_documents",
+            )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=junior,
+                action="document.access.denied",
+                allowed=False,
+            ).exists()
+        )
+
+    def test_document_search_returns_only_authorized_documents(self):
+        officer = staff("sales", Level.OFFICER)
+
+        results = search_documents_for_user(
+            user=officer,
+            query="Weekly Report",
+            tool_name="search_documents",
+        )
+
+        titles = {document.title for document in results}
+
+        self.assertIn("Sales Weekly Report", titles)
+        self.assertNotIn("Finance Weekly Report", titles)
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=officer,
+                action="document.search",
+                allowed=True,
+            ).exists()
+        )
+
+    def test_document_retrieval_denies_restricted_documents(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        payroll = doc("Payroll Register")
+
+        with self.assertRaises(PermissionDenied):
+            get_document_for_user(
+                user=junior,
+                document_id=payroll.pk,
+                tool_name="search_policies",
+            )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=junior,
+                action="document.read",
+                allowed=False,
+                object_ids=str(payroll.pk),
+            ).exists()
+        )
+
+    def test_chunk_search_enforces_parent_document_acl(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        payroll = doc("Payroll Register")
+
+        # Simulate an incorrectly permissive chunk ACL.
+        DocumentChunk.objects.filter(
+            document=payroll
+        ).update(
+            department=None,
+            sensitivity=Sensitivity.PUBLIC,
+            owner=None,
+            subject=None,
+        )
+
+        for chunk in payroll.chunks.all():
+            chunk.allowed_groups.clear()
+
+        results = search_chunks_for_user(
+            user=junior,
+            query="payroll",
+            tool_name="search_policies",
+        )
+
+        self.assertFalse(
+            any(
+                chunk.document_id == payroll.pk
+                for chunk in results
+            )
+        )
+
+    def test_private_data_service_only_returns_owners_items(self):
+        manager = staff("sales", Level.MANAGER)
+        officer = staff("sales", Level.OFFICER)
+
+        other_item = PrivateItem.objects.create(
+            owner=officer,
+            kind="note",
+            content="Officer's private note",
+        )
+
+        results = list_private_items_for_user(user=manager)
+
+        self.assertTrue(
+            all(
+                item.id != other_item.pk
+                for item in results
+            )
+        )
+
+        self.assertTrue(
+            all(
+                item.id in PrivateItem.objects.filter(
+                    owner=manager
+                ).values_list("pk", flat=True)
+                for item in results
+            )
+        )
+
+    def test_private_data_service_denies_cross_user_retrieval(self):
+        manager = staff("sales", Level.MANAGER)
+        officer = staff("sales", Level.OFFICER)
+
+        item = create_private_item_for_user(
+            user=officer,
+            kind="note",
+            content="Confidential personal note",
+        )
+
+        with self.assertRaises(PermissionDenied):
+            get_private_item_for_user(
+                user=manager,
+                item_id=item.id,
+            )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=manager,
+                action="private_item.read",
+                allowed=False,
+                object_ids=str(item.id),
+            ).exists()
+        )
+
+    def test_private_item_creation_assigns_authenticated_owner(self):
+        manager = staff("sales", Level.MANAGER)
+
+        result = create_private_item_for_user(
+            user=manager,
+            kind="preference",
+            content="Prefers concise operational reports.",
+        )
+
+        item = PrivateItem.objects.get(pk=result.id)
+
+        self.assertEqual(item.owner_id, manager.pk)
+        self.assertEqual(item.kind, "preference")
+
+    def test_inactive_user_cannot_access_private_data_service(self):
+        manager = staff("sales", Level.MANAGER)
+
+        manager.private_items.create(
+            kind="note",
+            content="Private note",
+        )
+
+        manager.is_active = False
+        manager.save()
+
+        with self.assertRaises(PermissionDenied):
+            list_private_items_for_user(user=manager)
+
+        with self.assertRaises(PermissionDenied):
+            create_private_item_for_user(
+                user=manager,
+                kind="note",
+                content="Another note",
+            )
+
+    def test_private_item_owner_can_update_and_delete(self):
+        manager = staff("sales", Level.MANAGER)
+
+        created = create_private_item_for_user(
+            user=manager,
+            kind="note",
+            content="Original note",
+        )
+
+        updated = update_private_item_for_user(
+            user=manager,
+            item_id=created.id,
+            content="Updated note",
+        )
+
+        self.assertEqual(updated.content, "Updated note")
+
+        delete_private_item_for_user(
+            user=manager,
+            item_id=created.id,
+        )
+
+        self.assertFalse(
+            PrivateItem.objects.filter(pk=created.id).exists()
+        )
+
+    def test_department_source_requires_matching_department_and_level(self):
+        sales_manager = staff("sales", Level.MANAGER)
+        sales_officer = staff("sales", Level.OFFICER)
+        procurement_manager = staff("procurement", Level.MANAGER)
+
+        source = self.make_data_source(
+            code="sales-management-data",
+            owner_department=sales_manager.department,
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.MANAGER,
+        )
+
+        self.assertEqual(
+            resolve_data_source_access(sales_manager, source).source.pk,
+            source.pk,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            resolve_data_source_access(sales_officer, source)
+
+        with self.assertRaises(PermissionDenied):
+            resolve_data_source_access(procurement_manager, source)
+
+    def test_company_source_allows_other_departments_within_level(self):
+        finance_manager = staff("finance", Level.MANAGER)
+        sales_manager = staff("sales", Level.MANAGER)
+        sales_officer = staff("sales", Level.OFFICER)
+
+        source = self.make_data_source(
+            code="company-management-reports",
+            owner_department=finance_manager.department,
+            access_mode=DataSourceAccessMode.COMPANY,
+            minimum_level=Level.MANAGER,
+        )
+
+        self.assertTrue(
+            data_sources_for_user(sales_manager).filter(
+                pk=source.pk
+            ).exists()
+        )
+
+        with self.assertRaises(PermissionDenied):
+            resolve_data_source_access(sales_officer, source)
+
+    def test_item_acl_source_defers_record_access_to_item_permissions(self):
+        sales_supervisor = staff("sales", Level.SUPERVISOR)
+        sales_officer = staff("sales", Level.OFFICER)
+
+        source = self.make_data_source(
+            code="hr-personnel-records",
+            owner_department=Department.objects.get(code="hr"),
+            access_mode=DataSourceAccessMode.ITEM_ACL,
+            minimum_level=Level.SUPERVISOR,
+        )
+
+        access = resolve_data_source_access(
+            sales_supervisor,
+            source,
+        )
+
+        self.assertTrue(access.requires_item_acl)
+
+        with self.assertRaises(PermissionDenied):
+            resolve_data_source_access(sales_officer, source)
+
+    def test_inactive_data_source_is_denied(self):
+        manager = staff("sales", Level.MANAGER)
+
+        source = self.make_data_source(
+            code="inactive-sales-source",
+            owner_department=manager.department,
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.JUNIOR,
+            is_active=False,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            resolve_data_source_access(manager, source)
+
+    def test_inactive_user_cannot_access_data_sources(self):
+        manager = staff("sales", Level.MANAGER)
+
+        source = self.make_data_source(
+            code="sales-data",
+            owner_department=manager.department,
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.JUNIOR,
+        )
+
+        stale_user = User.objects.get(pk=manager.pk)
+
+        User.objects.filter(pk=manager.pk).update(
+            is_active=False
+        )
+
+        with self.assertRaises(PermissionDenied):
+            resolve_data_source_access(stale_user, source)
+
+    def test_data_source_discovery_filters_by_user_permissions(self):
+        sales_manager = staff("sales", Level.MANAGER)
+
+        sales_source = self.make_data_source(
+            code="sales-data",
+            owner_department=sales_manager.department,
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.JUNIOR,
+        )
+
+        finance_source = self.make_data_source(
+            code="finance-data",
+            owner_department=Department.objects.get(code="finance"),
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.JUNIOR,
+        )
+
+        discovered_ids = set(
+            data_sources_for_user(sales_manager).values_list(
+                "pk",
+                flat=True,
+            )
+        )
+
+        self.assertIn(sales_source.pk, discovered_ids)
+        self.assertNotIn(finance_source.pk, discovered_ids)
+
+    def test_seeded_documents_have_registered_sources(self):
+        self.assertEqual(DataSource.objects.count(), 9)
+
+        self.assertEqual(
+            Document.objects.filter(data_source__isnull=True).count(),
+            0,
+        )
+
+        self.assertEqual(Document.objects.count(), 394)
+
+    def test_document_without_registered_source_is_denied(self):
+        junior = staff("warehouse", Level.JUNIOR)
+
+        document = Document.objects.create(
+            title="Unregistered Public Document",
+            body="This document has no registered data source.",
+            sensitivity=Sensitivity.PUBLIC,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            get_document_for_user(
+                user=junior,
+                document_id=document.pk,
+                tool_name="search_policies",
+            )
+
+        results = search_documents_for_user(
+            user=junior,
+            query="Unregistered Public Document",
+            tool_name="search_policies",
+        )
+
+        self.assertFalse(
+            any(result.id == document.pk for result in results)
+        )
+
+    def test_source_access_and_document_acl_are_both_required(self):
+        sales_manager = staff("sales", Level.MANAGER)
+        finance = Department.objects.get(code="finance")
+
+        source = self.make_data_source(
+            code="finance-restricted-source",
+            owner_department=finance,
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.JUNIOR,
+        )
+
+        # PUBLIC would ordinarily permit all active users to see this.
+        document = Document.objects.create(
+            title="Finance Source Boundary Test",
+            body="Synthetic financial information.",
+            department=finance,
+            sensitivity=Sensitivity.PUBLIC,
+            data_source=source,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            get_document_for_user(
+                user=sales_manager,
+                document_id=document.pk,
+                tool_name="search_policies",
+            )
+
+    def test_item_acl_source_preserves_cross_department_payslip_access(self):
+        employee = staff("sales", Level.OFFICER, 0)
+        another_employee = staff("sales", Level.OFFICER, 1)
+
+        own_payslip = payslip_of(employee)
+        another_payslip = payslip_of(another_employee)
+
+        result = get_document_for_user(
+            user=employee,
+            document_id=own_payslip.pk,
+            tool_name="search_policies",
+        )
+
+        self.assertEqual(result.id, own_payslip.pk)
+        self.assertEqual(result.data_source_code, "hr-documents")
+
+        with self.assertRaises(PermissionDenied):
+            get_document_for_user(
+                user=employee,
+                document_id=another_payslip.pk,
+                tool_name="search_policies",
+            )
+
+    def test_chunk_search_enforces_source_policy(self):
+        sales_manager = staff("sales", Level.MANAGER)
+        finance = Department.objects.get(code="finance")
+
+        source = self.make_data_source(
+            code="finance-chunk-boundary",
+            owner_department=finance,
+            access_mode=DataSourceAccessMode.DEPARTMENT,
+            minimum_level=Level.JUNIOR,
+        )
+
+        document = Document.objects.create(
+            title="Finance Chunk Boundary",
+            body="",
+            department=finance,
+            sensitivity=Sensitivity.PUBLIC,
+            data_source=source,
+        )
+
+        create_document_chunk(
+            document=document,
+            position=0,
+            text="unique-finance-source-boundary-marker",
+        )
+
+        results = search_chunks_for_user(
+            user=sales_manager,
+            query="unique-finance-source-boundary-marker",
+            tool_name="search_policies",
+        )
+
+        self.assertFalse(
+            any(
+                result.document_id == document.pk
+                for result in results
+            )
+        )
+

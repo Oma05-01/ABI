@@ -98,6 +98,74 @@ class AccessGroup(models.Model):
     def __str__(self):
         return self.code
 
+class DataSourceAccessMode(models.TextChoices):
+    DEPARTMENT = "department", "Owning department"
+    COMPANY = "company", "Company-wide"
+    ITEM_ACL = "item_acl", "Individual record ACL"
+
+class DataSourceType(models.TextChoices):
+    SHARED_FOLDER = "shared_folder", "Shared folder"
+    FILE_UPLOAD = "file_upload", "File upload"
+    DATABASE_TABLE = "database_table", "Database table"
+    DATABASE_VIEW = "database_view", "Database view"
+    DOCUMENT_COLLECTION = "document_collection", "Document collection"
+
+class DataSource(models.Model):
+    """
+    Registered logical source of company information.
+
+    Every source requires an owning department, an explicit
+    access policy and a minimum hierarchy level.
+
+    Credentials and connector secrets must never be stored here.
+    """
+
+    code = models.SlugField(max_length=80, unique=True)
+
+    name = models.CharField(max_length=150)
+
+    source_type = models.CharField(
+        max_length=30,
+        choices=DataSourceType.choices,
+    )
+
+    description = models.TextField(blank=True)
+
+    owner_department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        related_name="data_sources",
+    )
+
+    access_mode = models.CharField(
+        max_length=20,
+        choices=DataSourceAccessMode.choices,
+    )
+
+    minimum_level = models.PositiveSmallIntegerField(
+        choices=Level.choices,
+    )
+
+    is_active = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["code"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(
+                    minimum_level__gte=Level.EXECUTIVE,
+                    minimum_level__lte=Level.JUNIOR,
+                ),
+                name="datasource_minimum_level_valid",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} [{self.access_mode}]"
 
 class User(AbstractUser):
     employee_id = models.CharField(max_length=20, unique=True, null=True, blank=True)
@@ -176,6 +244,13 @@ class Document(AccessControlled):
     body = models.TextField(blank=True)
     source = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    data_source = models.ForeignKey(
+        DataSource,
+        on_delete=models.PROTECT,
+        related_name="documents",
+        null=True,
+        blank=True,
+    )
 
     def __str__(self):
         return self.title

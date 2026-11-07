@@ -17,7 +17,9 @@ from django.db import transaction
 from orgaccess import catalog
 from orgaccess.models import (
     AccessGroup, AuditLog, Department, Document, DocumentChunk, Level, PrivateItem, Role,
-    Sensitivity, TemporaryGrant, Tool, ToolGrant, User,
+    Sensitivity, TemporaryGrant, Tool, ToolGrant, User,DataSource,
+DataSourceAccessMode,
+DataSourceType,
 )
 from orgaccess.services.document_acl import create_document_chunk
 
@@ -79,6 +81,26 @@ class Command(BaseCommand):
         # tools and grants
         tools = {n: Tool.objects.create(name=n, tier=t, description=d) for n, t, d in catalog.TOOLS}
         all_depts = {**depts, "exec-office": exec_dept}
+        sources = {
+            code: DataSource.objects.create(
+                code=f"{code}-documents",
+                name=f"{dept.name} Document Collection",
+                source_type=DataSourceType.DOCUMENT_COLLECTION,
+                owner_department=dept,
+                access_mode=DataSourceAccessMode.ITEM_ACL,
+                minimum_level=Level.JUNIOR,
+            )
+            for code, dept in all_depts.items()
+        }
+
+        sources["company-policies"] = DataSource.objects.create(
+            code="company-policies",
+            name="Company Policies and General Documentation",
+            source_type=DataSourceType.DOCUMENT_COLLECTION,
+            owner_department=exec_dept,
+            access_mode=DataSourceAccessMode.COMPANY,
+            minimum_level=Level.JUNIOR,
+        )
         for g in catalog.GRANTS:
             lo, hi = g["levels"]
             ToolGrant.objects.create(
@@ -124,7 +146,7 @@ class Command(BaseCommand):
         for u in staff["it"]["officers"][:2]:
             u.access_groups.add(groups["it-admins"])
 
-        self._documents(depts, exec_dept, groups)
+        self._documents(depts, exec_dept, groups, sources)
         self._private_items(staff)
 
         n_users = User.objects.exclude(employee_id=None).count()
@@ -136,7 +158,7 @@ class Command(BaseCommand):
     # ---------- helpers ----------
 
     def _wipe(self):
-        for m in (AuditLog, TemporaryGrant, PrivateItem, DocumentChunk, Document, ToolGrant, Tool):
+        for m in (AuditLog, TemporaryGrant, PrivateItem, DocumentChunk, Document, DataSource, ToolGrant, Tool):
             m.objects.all().delete()
         User.objects.exclude(employee_id=None).delete()
         for m in (Role, Department, AccessGroup):
@@ -154,7 +176,7 @@ class Command(BaseCommand):
         u.save()
         return u
 
-    def _doc(self, title, body, dept, sens, owner=None, subject=None, groups=()):
+    def _doc(self, title, body, dept, sens, data_source, owner=None, subject=None, groups=()):
         doc = Document.objects.create(
             title=title,
             body=body,
@@ -163,6 +185,7 @@ class Command(BaseCommand):
             owner=owner,
             subject=subject,
             source="seed",
+            data_source=data_source,
         )
 
         # Assign the complete parent ACL before creating chunks.
@@ -180,27 +203,115 @@ class Command(BaseCommand):
 
         return doc
 
-    def _documents(self, depts, exec_dept, groups):
+    def _documents(self, depts, exec_dept, groups, sources):
         S = Sensitivity
-        self._doc("Code of Conduct", "Synthetic code of conduct for all staff.", None, S.PUBLIC)
+
+        company_source = sources["company-policies"]
+
+        self._doc(
+            "Code of Conduct",
+            "Synthetic code of conduct for all staff.",
+            None,
+            S.PUBLIC,
+            company_source,
+        )
+
         for t in ("Leave Policy", "Expense Policy", "Data Protection Policy"):
-            self._doc(t, f"Synthetic {t.lower()} for all staff.", None, S.INTERNAL)
+            self._doc(
+                t,
+                f"Synthetic {t.lower()} for all staff.",
+                None,
+                S.INTERNAL,
+                company_source,
+            )
+
         for code, dept in depts.items():
             n = dept.name
-            self._doc(f"{n} SOP", f"Standard operating procedures for {n}.", dept, S.INTERNAL)
-            self._doc(f"{n} Team Handbook", f"Internal handbook for the {n} team.", dept, S.DEPARTMENTAL)
-            self._doc(f"{n} Weekly Report", f"Weekly activity report for {n}.", dept, S.DEPARTMENTAL)
-            self._doc(f"{n} Budget and Targets", f"Budget and targets for {n}.", dept, S.CONFIDENTIAL)
-        self._doc("Supplier Contracts 2026", "Synthetic supplier contract terms and prices.", depts["procurement"], S.CONFIDENTIAL)
-        self._doc("General Ledger Summary", "Synthetic general ledger summary.", depts["finance"], S.CONFIDENTIAL)
-        self._doc("Board Pack Q3", "Synthetic board pack.", exec_dept, S.CONFIDENTIAL)
-        self._doc("Payroll Register", "Synthetic payroll register for all staff.", depts["hr"], S.RESTRICTED,
-                  groups=[groups["payroll-team"], groups["dpo"]])
-        self._doc("Disciplinary Case File HR-017", "Synthetic disciplinary case file.", depts["hr"], S.RESTRICTED,
-                  groups=[groups["hr-casework"], groups["dpo"]])
+
+            self._doc(
+                f"{n} SOP",
+                f"Standard operating procedures for {n}.",
+                dept,
+                S.INTERNAL,
+                sources[code],
+            )
+
+            self._doc(
+                f"{n} Team Handbook",
+                f"Internal handbook for the {n} team.",
+                dept,
+                S.DEPARTMENTAL,
+                sources[code],
+            )
+
+            self._doc(
+                f"{n} Weekly Report",
+                f"Weekly activity report for {n}.",
+                dept,
+                S.DEPARTMENTAL,
+                sources[code],
+            )
+
+            self._doc(
+                f"{n} Budget and Targets",
+                f"Budget and targets for {n}.",
+                dept,
+                S.CONFIDENTIAL,
+                sources[code],
+            )
+
+        self._doc(
+            "Supplier Contracts 2026",
+            "Synthetic supplier contract terms and prices.",
+            depts["procurement"],
+            S.CONFIDENTIAL,
+            sources["procurement"],
+        )
+
+        self._doc(
+            "General Ledger Summary",
+            "Synthetic general ledger summary.",
+            depts["finance"],
+            S.CONFIDENTIAL,
+            sources["finance"],
+        )
+
+        self._doc(
+            "Board Pack Q3",
+            "Synthetic board pack.",
+            exec_dept,
+            S.CONFIDENTIAL,
+            sources["exec-office"],
+        )
+
+        self._doc(
+            "Payroll Register",
+            "Synthetic payroll register for all staff.",
+            depts["hr"],
+            S.RESTRICTED,
+            sources["hr"],
+            groups=[groups["payroll-team"], groups["dpo"]],
+        )
+
+        self._doc(
+            "Disciplinary Case File HR-017",
+            "Synthetic disciplinary case file.",
+            depts["hr"],
+            S.RESTRICTED,
+            sources["hr"],
+            groups=[groups["hr-casework"], groups["dpo"]],
+        )
+
         for u in User.objects.exclude(employee_id=None):
-            self._doc(f"Payslip {u.employee_id}", f"Synthetic payslip for {u.get_full_name()}.", depts["hr"],
-                      S.RESTRICTED, subject=u, groups=[groups["payroll-team"]])
+            self._doc(
+                f"Payslip {u.employee_id}",
+                f"Synthetic payslip for {u.get_full_name()}.",
+                depts["hr"],
+                S.RESTRICTED,
+                sources["hr"],
+                subject=u,
+                groups=[groups["payroll-team"]],
+            )
 
     def _private_items(self, staff):
         for dept in staff.values():
